@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Web.Script.Serialization;
@@ -10,7 +11,6 @@ using Pokewatch.Datatypes;
 using Pokewatch.DataTypes;
 using POGOLib.Net;
 using POGOLib.Net.Authentication;
-using POGOLib.Pokemon;
 using POGOLib.Pokemon.Data;
 using POGOProtos.Enums;
 using POGOProtos.Map;
@@ -24,19 +24,9 @@ namespace Pokewatch
 {
 	public class Program
 	{
-	    private static int _regionIndex;
-	    private static int _locationInt;
-        private static DateTime _lastTweet = DateTime.MinValue;
-
-        private static readonly Queue<FoundPokemon> TweetedPokemon = new Queue<FoundPokemon>();
-        private static readonly ManualResetEvent QuitEvent = new ManualResetEvent(false);
-
-        public static void Main(string[] args)
+		public static void Main(string[] args)
 		{
-		    _regionIndex = 0;
-		    _locationInt = 0;
-
-            try
+			try
 			{
 				string json = File.ReadAllText("Configuration.json");
 				s_config = new JavaScriptSerializer().Deserialize<Configuration>(json);
@@ -48,6 +38,24 @@ namespace Pokewatch
 				return;
 			}
 
+			try
+			{
+				s_scanAreas = s_config.Regions.SelectMany(r => r.Locations.Select(l => new ScanArea
+				{
+					Location = l,
+					Name = r.Name,
+					Prefix = r.Prefix,
+					Suffix = r.Suffix
+				})).ToList();
+				s_currentScan = s_scanAreas.First();
+				s_scanIndex = 0;
+			}
+			catch
+			{
+				Log("[-]Invalid Region Configuration");
+				return;
+			}
+
 			if ((s_config.PTCUsername.IsNullOrEmpty() || s_config.PTCPassword.IsNullOrEmpty()) && (s_config.GAPassword.IsNullOrEmpty() || s_config.GAUsername.IsNullOrEmpty()))
 			{
 				Log("[-]Username and password must be supplied for either PTC or Google.");
@@ -55,129 +63,99 @@ namespace Pokewatch
 			}
 
 			if (!PrepareTwitterClient())
-				return;
+				throw new Exception();
 
 			Log("[+]Sucessfully signed in to twitter.");
-			if (PrepareClient())
+			if (!PrepareClient())
 			{
-				Log("[+]Sucessfully signed in to PokemonGo, beginning search.");
+				Log("[-]Unable to sign in to PokemonGo.");
+				throw new Exception();
 			}
 
-            s_pogoSession.AccessTokenUpdated += (sender, eventArgs) =>
-            {
-                Log("[+]Access token updated.");
-            };
+			s_pogoSession.AccessTokenUpdated += (sender, eventArgs) =>
+			{
+				Log("[+]Access token updated.");
+			};
 
-            s_pogoSession.Map.Update += (sender, eventArgs) =>
-            {
-                Log("[+]Map was updated.");
-                if (ProcessMap())
-                {
-                    NextLocation();
-                }
-            };
+			s_pogoSession.Map.Update += (sender, eventArgs) =>
+			{
+				Log("[+]Location Acknowleged. Searching...");
+				if (Search())
+					UpdateLocation();
+			};
 
-            Console.CancelKeyPress += (sender, eArgs) => {
-                QuitEvent.Set();
-                eArgs.Cancel = true;
-            };
-            
-            QuitEvent.WaitOne();
-        }
+			Console.CancelKeyPress += (sender, eArgs) => {
+				QuitEvent.Set();
+				eArgs.Cancel = true;
+			};
 
-	    private static void NextLocation()
-	    {
-	        _locationInt++;
-	        if (_locationInt == s_config.Regions[_regionIndex].Locations.Count)
-	        {
-	            _locationInt = 0;
-	            _regionIndex++;
-	            if (_regionIndex == s_config.Regions.Count)
-	            {
-	                _regionIndex = 0;
-	            }
-	        }
+			QuitEvent.WaitOne();
+		}
 
-            Region region = s_config.Regions[_regionIndex];
-            Log($"[!]Searching Region {_regionIndex}: {region.Name}");
-            Location location = region.Locations[_locationInt];
-            Log($"[!]Going to Location {_locationInt}: {location.Latitude}, {location.Longitude}");
+		private static void UpdateLocation()
+		{
+			s_scanIndex++;
+			if (s_scanIndex == s_scanAreas.Count)
+			{
+				s_scanIndex = 0;
+				Log("[!]All Regions Scanned. Starting over.");
+			}
+			s_currentScan = s_scanAreas[s_scanIndex];
+			SetLocation(s_currentScan.Location);
+			Log($"[!]Scanning: {s_currentScan.Name} ({s_currentScan.Location.Latitude}, {s_currentScan.Location.Longitude})");
+		}
 
-            SetLocation(location);
-        }
+		private static bool Search()
+		{
+			RepeatedField<MapCell> mapCells = s_pogoSession.Map.Cells;
+			foreach (var mapCell in mapCells)
+			{
+				foreach (WildPokemon pokemon in mapCell.WildPokemons)
+				{
+					FoundPokemon foundPokemon = ProcessPokemon(pokemon, s_tweetedPokemon, s_lastTweet);
 
-        private static bool ProcessMap()
-        {
-            Region region = s_config.Regions[_regionIndex];
+					if (foundPokemon == null)
+						continue;
 
-            Log("[!]Searching nearby cells.");
-            RepeatedField<MapCell> mapCells;
-            try
-            {
-                mapCells = s_pogoSession.Map.Cells;
-            }
-            catch
-            {
-                Log("[-]Heartbeat has failed. Terminating Connection.");
-                return false;
-            }
-            foreach (var mapCell in mapCells)
-            {
-                foreach (WildPokemon pokemon in mapCell.WildPokemons)
-                {
-                    FoundPokemon foundPokemon = ProcessPokemon(pokemon, TweetedPokemon, _lastTweet);
+					string tweet = ComposeTweet(foundPokemon);
 
-                    if (foundPokemon == null)
-                        continue;
+					if (tweet == null)
+						throw new Exception();
 
-                    string tweet = ComposeTweet(foundPokemon, region);
+					if (Tweet.Length(tweet) > 140)
+					{
+						Log("[-]Tweet exceeds 140 characters. Consider changing your template: " + tweet);
+						continue;
+					}
+					try
+					{
+						s_twitterClient.PublishTweet(tweet);
+						Log("[+]Tweet published: " + tweet);
+						s_lastTweet = DateTime.Now;
+					}
+					catch (Exception ex)
+					{
+						Log("[-]Tweet failed to publish: " + tweet + " " + ex.Message);
+					}
 
-                    try
-                    {
-                        s_twitterClient.PublishTweet(tweet);
-                        Log("[+]Tweet published: " + tweet);
-                        _lastTweet = DateTime.Now;
-                    }
-                    catch (Exception ex)
-                    {
-                        Log("[-]Tweet failed to publish: " + tweet + " " + ex.Message);
-                    }
-                    finally
-                    {
-                        TweetedPokemon.Enqueue(foundPokemon);
-                    }
+					s_tweetedPokemon.Enqueue(foundPokemon);
 
-                    if (TweetedPokemon.Count > 100)
-                    {
-                        TweetedPokemon.Dequeue();
-                    }
-                }
-                
-            }
-            Log("[!]Finished Searching " + region.Name);
-            return true;
+					if (s_tweetedPokemon.Count > 10)
+						s_tweetedPokemon.Dequeue();
+				}
+			}
+			return true;
+		}
 
-        }
-        
 		//Sign in to PokemonGO
 		private static bool PrepareClient()
 		{
-			Location defaultLocation;
-			try
-			{
-				defaultLocation = s_config.Regions.First().Locations.First();
-			}
-			catch
-			{
-				Log("[-]No locations have been supplied.");
-				return false;
-			}
 			if (!s_config.PTCUsername.IsNullOrEmpty() && !s_config.PTCPassword.IsNullOrEmpty())
 			{
 				try
 				{
 					Log("[!]Attempting to sign in to PokemonGo using PTC.");
-					s_pogoSession = Login.GetSession(s_config.PTCUsername, s_config.PTCPassword, LoginProvider.PokemonTrainerClub, defaultLocation.Latitude, defaultLocation.Longitude);
+					s_pogoSession = Login.GetSession(s_config.PTCUsername, s_config.PTCPassword, LoginProvider.PokemonTrainerClub, s_currentScan.Location.Latitude, s_currentScan.Location.Longitude);
 					Log("[+]Sucessfully logged in to PokemonGo using PTC.");
 					return true;
 				}
@@ -191,7 +169,7 @@ namespace Pokewatch
 				try
 				{
 					Log("[!]Attempting to sign in to PokemonGo using Google.");
-					s_pogoSession = Login.GetSession(s_config.GAUsername, s_config.GAPassword, LoginProvider.GoogleAuth, defaultLocation.Latitude, defaultLocation.Longitude);
+					s_pogoSession = Login.GetSession(s_config.GAUsername, s_config.GAPassword, LoginProvider.GoogleAuth, s_currentScan.Location.Latitude, s_currentScan.Location.Longitude);
 					Log("[+]Sucessfully logged in to PokemonGo using Google.");
 					return true;
 				}
@@ -220,7 +198,7 @@ namespace Pokewatch
 			{
 				s_twitterClient = User.GetAuthenticatedUser(userCredentials);
 			}
-			catch
+			catch(Exception ex)
 			{
 				Log("[-]Unable to authenticate Twitter account. Check your internet connection, verify your OAuth credential strings. If your bot is new, Twitter may still be validating your application.");
 				return false;
@@ -273,71 +251,81 @@ namespace Pokewatch
 		}
 
 		//Build a tweet with useful information about the pokemon, then cram in as many hashtags as will fit.
-		private static string ComposeTweet(FoundPokemon pokemon, Region region)
+		private static string ComposeTweet(FoundPokemon pokemon)
 		{
 			Log("[!]Composing Tweet");
 			string latitude = pokemon.Location.Latitude.ToString(System.Globalization.CultureInfo.GetCultureInfo("en-us"));
 			string longitude = pokemon.Location.Longitude.ToString(System.Globalization.CultureInfo.GetCultureInfo("en-us"));
-			string mapsLink = $"https://www.google.com/maps/place/{latitude},{longitude}";
+			string mapsLink = s_config.Pokevision ? $"https://pokevision.com/#/@{latitude},{longitude}" : $"https://www.google.com/maps/place/{latitude},{longitude}";
 			string expiration = DateTime.Now.AddSeconds(pokemon.LifeExpectancy).ToLocalTime().ToShortTimeString();
 			string tweet = "";
 
-			if (s_config.PriorityPokemon.Contains(pokemon.Kind))
+			try
 			{
-				tweet = string.Format(s_config.PriorityTweet, SpellCheckPokemon(pokemon.Kind), region.Prefix, region.Name, region.Suffix, expiration, mapsLink);
+				tweet = string.Format(s_config.PriorityPokemon.Contains(pokemon.Kind) ? s_config.PriorityTweet : s_config.RegularTweet,
+					SpellCheckPokemon(pokemon.Kind),
+					s_currentScan.Prefix,
+					s_currentScan.Name,
+					s_currentScan.Suffix,
+					expiration,
+					mapsLink);
 			}
-			else
+			catch
 			{
-				tweet = string.Format(s_config.RegularTweet, SpellCheckPokemon(pokemon.Kind), region.Prefix, region.Name, region.Suffix, expiration, mapsLink);
+				Log("[-]Failed to format tweet. If you made customizations, they probably broke it.");
+				return null;
 			}
 
 			tweet = Regex.Replace(tweet, @"\s\s", @" ");
 			tweet = Regex.Replace(tweet, @"\s[!]", @"!");
 
-			if (s_config.TagPokemon && (Tweet.Length(tweet + " #" + SpellCheckPokemon(pokemon.Kind, true)) < 138))
-				tweet += " #" + SpellCheckPokemon(pokemon.Kind, true);
+			Regex hashtag = new Regex("[^a-zA-Z0-9]");
 
-			if (s_config.TagRegion && (Tweet.Length(tweet + " #" + Regex.Replace(region.Name, @"\s+", "")) < 138))
-				tweet += " #" + Regex.Replace(region.Name, @"\s+", "");
+			if (s_config.TagPokemon && (Tweet.Length(tweet + " #" + hashtag.Replace(SpellCheckPokemon(pokemon.Kind), "")) < 140))
+				tweet += " #" + hashtag.Replace(SpellCheckPokemon(pokemon.Kind), "");
+
+			if (s_config.TagRegion && (Tweet.Length(tweet + " #" + hashtag.Replace(s_currentScan.Name, "")) < 140))
+				tweet += " #" + hashtag.Replace(s_currentScan.Name, "");
 
 			foreach(string tag in s_config.CustomTags)
 			{
-				if(Tweet.Length(tweet + tag) < 138)
-					tweet += " #" + tag;
+				if(Tweet.Length(tweet + " #" + hashtag.Replace(tag, "")) < 140)
+					tweet += " #" + hashtag.Replace(tag, "");
 			}
 
+			byte[] bytes = Encoding.Default.GetBytes(tweet);
+			tweet = Encoding.UTF8.GetString(bytes);
 			Log("[!]Sucessfully composed tweet.");
 			return tweet;
 		}
 
-		//Generate user friendly and hashtag friendly pokemon names
-		private static string SpellCheckPokemon(PokemonId pokemon, bool isHashtag = false)
+		//Generate user friendly pokemon names
+		private static string SpellCheckPokemon(PokemonId pokemon)
 		{
 			string display;
 			switch (pokemon)
 			{
 				case PokemonId.Farfetchd:
-					display = isHashtag ? "Farfetchd" : "Farfetch'd";
+					display = "Farfetch'd";
 					break;
 				case PokemonId.MrMime:
-					display = isHashtag ? "MrMime" : "Mr. Mime";
+					display = "Mr. Mime";
 					break;
 				case PokemonId.NidoranFemale:
-					display = isHashtag ? "Nidoran" : "Nidoran♀";
+					display = "Nidoran♀";
 					break;
 				case PokemonId.NidoranMale:
-					display = isHashtag ? "Nidoran" : "Nidoran♂";
+					display = "Nidoran♂";
 					break;
 				default:
 					display = pokemon.ToString();
 					break;
 			}
-			if (s_config.PokemonOverrides.Any(po => po.Kind == pokemon))
+			if (s_config.PokemonOverrides != null && s_config.PokemonOverrides.Any(po => po.Kind == pokemon))
 			{
 				display = s_config.PokemonOverrides.First(po => po.Kind == pokemon).Display;
 			}
-			Regex regex = new Regex("[^a-zA-Z0-9]");
-			return isHashtag ? regex.Replace(display, "") : display;
+			return display;
 		}
 
 		private static void Log(string message)
@@ -352,6 +340,11 @@ namespace Pokewatch
 		private static Configuration s_config;
 		private static IAuthenticatedUser s_twitterClient;
 		private static Session s_pogoSession;
-
+		private static DateTime s_lastTweet = DateTime.MinValue;
+		private static Queue<FoundPokemon> s_tweetedPokemon = new Queue<FoundPokemon>();
+		private static List<ScanArea> s_scanAreas = new List<ScanArea>();
+		private static ScanArea s_currentScan;
+		private static int s_scanIndex;
+		private static readonly ManualResetEvent QuitEvent = new ManualResetEvent(false);
 	}
 }
